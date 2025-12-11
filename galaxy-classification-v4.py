@@ -1,10 +1,12 @@
 import time
 import h5py
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import ToTensor
+from sklearn.model_selection import train_test_split
 import kornia.augmentation as K
 
 
@@ -17,12 +19,24 @@ h5_path = "C:/Users/roger/OneDrive/Área de Trabalho/coisas da universidade/2-20
 # 1. Dataset Loader for Galaxy10 DECals (.h5 file)
 # ============================================================
 
+def SplitDataset(h5_path, ratio=0.8):
+    with h5py.File(h5_path, "r") as f: 
+        images = f["images"][:]
+        labels = f["ans"][:]
+
+    train_idx, val_idx = train_test_split(np.arange(labels.shape[0]), train_size=ratio, shuffle=True, stratify=labels)
+
+    train_images = images[train_idx]
+    val_images  = images[val_idx]
+
+    train_labels = labels[train_idx]
+    val_labels  = labels[val_idx]
+    return train_images, train_labels, val_images, val_labels
+
 class Galaxy10DECals(Dataset): 
-    def __init__(self, h5_path): 
-        super().__init__() 
-        with h5py.File(h5_path, "r") as f: 
-            self.images = f["images"][:]
-            self.labels = f["ans"][:] 
+    def __init__(self, images, labels): 
+        self.images = images
+        self.labels = labels
 
     def __len__(self): 
         return len(self.labels) 
@@ -40,31 +54,32 @@ class GalaxyCNN(nn.Module):
 
         def ConvolutionBlock(in_channels, out_channels, kernel_size, dropout):
             return nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2, bias=False),
+                nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding='same', bias=False),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(),
+
                 nn.Dropout(dropout),
                 nn.MaxPool2d(2)
             )
         
-        def BottleneckBlock(in_ch, out_ch, kernel_size, dropout):
-            mid = out_ch // 4
+        def BottleneckBlock(in_channel, out_channel, kernel_size, dropout):
+            in_between = out_channel // 4
 
             return nn.Sequential(
-                nn.Conv2d(in_ch, mid, kernel_size=1, bias=False),
-                nn.BatchNorm2d(mid),
+                nn.Conv2d(in_channel, in_between, kernel_size=1, bias=False),
+                nn.BatchNorm2d(in_between),
                 nn.ReLU(),
 
-                nn.Conv2d(mid, mid, kernel_size=kernel_size, padding=kernel_size//2, bias=False),
-                nn.BatchNorm2d(mid),
+                nn.Conv2d(in_between, in_between, kernel_size=kernel_size, padding='same', bias=False),
+                nn.BatchNorm2d(in_between),
                 nn.ReLU(),
 
-                nn.Conv2d(mid, out_ch, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_ch),
+                nn.Conv2d(in_between, out_channel, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channel),
                 nn.ReLU(),
 
-                nn.MaxPool2d(2),
-                nn.Dropout(dropout)
+                nn.Dropout(dropout),
+                nn.MaxPool2d(2)
     )
         
         def OutputBlock(in_channels, out_channels, dropout):
@@ -77,14 +92,14 @@ class GalaxyCNN(nn.Module):
                 nn.Linear(out_channels, num_classes)
             )
         
-        self.featuremap1 = ConvolutionBlock(3, 32, 4, 0.1)
-        self.featuremap2 = BottleneckBlock(32, 64, 4, 0.1)
-        self.featuremap3 = ConvolutionBlock(64, 128, 3, 0.15)
-        self.featuremap4 = BottleneckBlock(128, 256, 4, 0.15)
-        self.featuremap5 = ConvolutionBlock(256, 512, 3, 0.2)
-        self.featuremap6 = BottleneckBlock(512, 1024, 3, 0.2)
+        self.featuremap1 = ConvolutionBlock(3, 32, 3, 0.02)
+        self.featuremap2 = BottleneckBlock(32, 64, 5, 0.03)
+        self.featuremap3 = BottleneckBlock(64, 128, 3, 0.04)
+        self.featuremap4 = ConvolutionBlock(128, 256, 3, 0.06)
+        self.featuremap5 = BottleneckBlock(256, 512, 3, 0.07)
+        self.featuremap6 = BottleneckBlock(512, 1024, 3, 0.08)
 
-        self.classification = OutputBlock(1024, 1024, 0.4)
+        self.classification = OutputBlock(1024, 512, 0.25)
 
     def forward(self, x):
         x = self.featuremap1(x)
@@ -107,10 +122,9 @@ class DataAugmentation(nn.Module):
         self.transforms = K.AugmentationSequential(
             K.RandomHorizontalFlip(p=0.5),
             K.RandomVerticalFlip(p=0.5),
-            K.RandomRotation(degrees=180., p=0.5),
-            K.RandomResizedCrop(size=(256, 256), scale=(0.8, 1.0), p=0.5),
-            K.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, p=0.5),
-            K.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5])
+            K.RandomRotation(degrees=150., p=0.5),
+            K.RandomResizedCrop(size=(256, 256), scale=(0.75, 1.0), p=0.5),
+            K.ColorJiggle(brightness=0.15, contrast=0.15, saturation=0.15, p=0.5)
         )
 
     def forward(self, x):
@@ -123,25 +137,20 @@ normalize = K.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5]).to(device)
 # 4. Subsets definition
 # ============================================================
 
-def DatasetSplit(dataset, split):
-    data_length = len(dataset)
-    train_size = int(split * data_length)
-    val_size = data_length - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    return train_dataset, val_dataset
+train_images, train_labels, val_images, val_labels = SplitDataset(h5_path, ratio=0.7)
 
-dataset = Galaxy10DECals(h5_path)
-train_dataset, val_dataset = DatasetSplit(dataset, 0.8)
+train_dataset = Galaxy10DECals(train_images, train_labels)
+val_dataset = Galaxy10DECals(val_images, val_labels)
 
 train_loader = DataLoader(
     train_dataset,
-    batch_size=64,
+    batch_size=32,
     shuffle=True
 )
 
 val_loader = DataLoader(
     val_dataset,
-    batch_size=64,
+    batch_size=32,
     shuffle=False
 )
 
@@ -157,7 +166,7 @@ print("\nUsing device:", device,'\n')
 
 def Learning(epochs):
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
 
     for epoch in range(epochs):
         # -----------------------
@@ -171,6 +180,7 @@ def Learning(epochs):
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(device), labels.to(device)
             imgs = data_augmenter(imgs)
+            imgs = normalize(imgs)
 
             optimizer.zero_grad()
             outputs = model(imgs)
@@ -222,7 +232,7 @@ def Learning(epochs):
             f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}"
         )
 
-Learning(epochs=20)
+Learning(epochs=30)
 print("Training complete.")
 
-print(f'Time elapsed: {time.strftime("%M:%S", time.gmtime(time.time() - beginning))}')
+print(f'Time elapsed: {time.strftime("%M:%S", time.gmtime(time.time() - beginning))}') 
